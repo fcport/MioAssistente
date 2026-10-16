@@ -48,9 +48,11 @@ class WakeWordService : Service() {
         super.onCreate()
         startAsForeground()
         // Il callback può arrivare subito (anche prima che "tts" sia assegnato): lo gestiamo dopo.
-        tts = TextToSpeech(this) { status ->
-            main.post { onTtsInit(status) }
-        }
+        val googleTts = "com.google.android.tts"
+        val hasGoogleTts = try { packageManager.getPackageInfo(googleTts, 0); true } catch (_: Throwable) { false }
+        val ttsListener = TextToSpeech.OnInitListener { status -> main.post { onTtsInit(status) } }
+        tts = if (hasGoogleTts) TextToSpeech(this, ttsListener, googleTts) else TextToSpeech(this, ttsListener)
+        App.log(this, "Voce: ${if (hasGoogleTts) "Google" else "predefinita del telefono (Google TTS non installato)"}")
         tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
             override fun onStart(id: String?) {}
             override fun onError(id: String?) { main.post { startWakeWord() } }
@@ -256,7 +258,7 @@ class WakeWordService : Service() {
     // ---------- 2. Ascolto della frase ----------
     private fun listenForCommand() {
         recognizer?.destroy()
-        recognizer = SpeechRecognizer.createSpeechRecognizer(this).apply {
+        recognizer = createItalianRecognizer().apply {
             setRecognitionListener(object : RecognitionListener {
                 override fun onResults(results: Bundle) {
                     val text = results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
@@ -276,8 +278,23 @@ class WakeWordService : Service() {
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, "it-IT")
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "it-IT")
+            putExtra(RecognizerIntent.EXTRA_ONLY_RETURN_LANGUAGE_PREFERENCE, true)
+            putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, packageName)
         }
         recognizer?.startListening(intent)
+    }
+
+    /** Usa il riconoscimento vocale di Google se presente (quello Xiaomi può essere in cinese). */
+    private fun createItalianRecognizer(): SpeechRecognizer {
+        val services = packageManager.queryIntentServices(
+            Intent(android.speech.RecognitionService.SERVICE_INTERFACE), 0
+        ).map { android.content.ComponentName(it.serviceInfo.packageName, it.serviceInfo.name) }
+        val google = services.firstOrNull { it.packageName == "com.google.android.googlequicksearchbox" }
+            ?: services.firstOrNull { it.packageName.startsWith("com.google") }
+        App.log(this, "Riconoscitori disponibili: ${services.joinToString { it.packageName }} -> uso ${google?.packageName ?: "predefinito"}")
+        return if (google != null) SpeechRecognizer.createSpeechRecognizer(this, google)
+        else SpeechRecognizer.createSpeechRecognizer(this)
     }
 
     // ---------- 3. Chiamata a Hermes (API compatibile OpenAI) ----------
@@ -286,6 +303,7 @@ class WakeWordService : Service() {
 
     private fun askAgent(text: String) {
         updateNotification("Hai detto: $text")
+        App.log(this, "Hai detto: $text")
         Thread {
             val reply = try {
                 history += JSONObject().put("role", "user").put("content", text)
@@ -336,6 +354,7 @@ class WakeWordService : Service() {
 
     // ---------- 4. Risposta a voce ----------
     private fun speak(text: String) {
+        App.log(this, "Risposta: ${text.take(120)}")
         updateNotification(text)
         val ok = ttsReady && try {
             tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "reply") == TextToSpeech.SUCCESS
