@@ -4,6 +4,9 @@ on:
   push:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -29,3 +32,12 @@ jobs:
         with:
           name: MioAssistente-app
           path: MioAssistente.apk
+
+      - name: Pubblica per il download dal telefono
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ultima
+          name: Mio Assistente (ultima versione)
+          body: Apri questa pagina dal telefono e tocca MioAssistente.apk per installare.
+          files: MioAssistente.apk
+          make_latest: true
