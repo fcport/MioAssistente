@@ -30,6 +30,14 @@ jobs:
             exit 1
           }
 
+      - name: Controllo librerie native (pagine 16 KB)
+        run: |
+          mkdir so && cd so && unzip -q ../app/build/outputs/apk/debug/app-debug.apk 'lib/*' || true
+          for f in $(find . -name '*.so'); do
+            a=$(readelf -lW "$f" | awk '/LOAD/{print $NF; exit}')
+            echo "::notice::$f align=$a"
+          done
+
       - name: Rinomina
         run: cp app/build/outputs/apk/debug/app-debug.apk MioAssistente.apk
 
