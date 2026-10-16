@@ -256,33 +256,76 @@ class WakeWordService : Service() {
     }
 
     // ---------- 2. Ascolto della frase ----------
+    // Ascolto della domanda con il modello italiano Vosk (offline, sempre in italiano).
+    private var commandListener: SpeechService? = null
+    private var commandDone = false
+    private val heard = StringBuilder()
+    private val finishCommand = Runnable { completeCommand() }
+
     private fun listenForCommand() {
-        recognizer?.destroy()
-        recognizer = createItalianRecognizer().apply {
-            setRecognitionListener(object : RecognitionListener {
-                override fun onResults(results: Bundle) {
-                    val text = results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                        ?.firstOrNull()
-                    if (text.isNullOrBlank()) startWakeWord() else askAgent(text)
-                }
-                override fun onError(error: Int) { startWakeWord() }
-                override fun onReadyForSpeech(p: Bundle?) {}
-                override fun onBeginningOfSpeech() {}
-                override fun onRmsChanged(v: Float) {}
-                override fun onBufferReceived(b: ByteArray?) {}
-                override fun onEndOfSpeech() {}
-                override fun onPartialResults(p: Bundle?) {}
-                override fun onEvent(t: Int, p: Bundle?) {}
-            })
+        val m = model ?: run { startWakeWord(); return }
+        commandDone = false
+        heard.clear()
+        try {
+            val rec = Recognizer(m, 16000f)
+            commandListener = SpeechService(rec, 16000f).also {
+                it.startListening(object : org.vosk.android.RecognitionListener {
+                    override fun onPartialResult(hyp: String?) {
+                        val p = parse(hyp, "partial")
+                        if (p.isNotBlank()) {
+                            // sta ancora parlando: rimanda la chiusura
+                            main.removeCallbacks(finishCommand)
+                            main.postDelayed(finishCommand, 2_500)
+                            updateNotification("… ${(heard.toString() + " " + p).trim()}")
+                        }
+                    }
+                    override fun onResult(hyp: String?) {
+                        val t = parse(hyp, "text")
+                        if (t.isNotBlank()) {
+                            heard.append(' ').append(t)
+                            // aspetta un attimo: se non dici altro, invia
+                            main.removeCallbacks(finishCommand)
+                            main.postDelayed(finishCommand, 1_200)
+                        }
+                    }
+                    override fun onFinalResult(hyp: String?) {
+                        val t = parse(hyp, "text")
+                        if (t.isNotBlank()) heard.append(' ').append(t)
+                        main.post { completeCommand() }
+                    }
+                    override fun onError(e: Exception?) {
+                        App.log(this@WakeWordService, "Errore ascolto domanda: $e")
+                        main.post { completeCommand() }
+                    }
+                    override fun onTimeout() { main.post { completeCommand() } }
+                }, 15_000) // massimo 15 secondi per la domanda
+            }
+            // se non dici nulla entro 6 secondi, torna in attesa di "ehi hermes"
+            main.postDelayed(finishCommand, 6_000)
+        } catch (e: Throwable) {
+            App.log(this, "Errore avvio ascolto domanda: $e")
+            startWakeWord()
         }
-        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE, "it-IT")
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "it-IT")
-            putExtra(RecognizerIntent.EXTRA_ONLY_RETURN_LANGUAGE_PREFERENCE, true)
-            putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, packageName)
+    }
+
+    private fun parse(hyp: String?, key: String): String =
+        try { hyp?.let { JSONObject(it).optString(key) } ?: "" } catch (_: Throwable) { "" }
+
+    private fun completeCommand() {
+        if (commandDone) return
+        commandDone = true
+        main.removeCallbacks(finishCommand)
+        commandListener?.stop(); commandListener?.shutdown(); commandListener = null
+        // togli l'eventuale frase di attivazione ripetuta all'inizio
+        var text = heard.toString().trim()
+        val wn = norm(wakePhrase)
+        if (norm(text).startsWith(wn)) text = text.split(" ").drop(wakePhrase.split(" ").size).joinToString(" ")
+        if (text.isBlank()) {
+            App.log(this, "Nessuna domanda sentita")
+            startWakeWord()
+        } else {
+            askAgent(text)
         }
-        recognizer?.startListening(intent)
     }
 
     /** Usa il riconoscimento vocale di Google se presente (quello Xiaomi può essere in cinese). */
@@ -414,6 +457,7 @@ class WakeWordService : Service() {
 
     override fun onDestroy() {
         stopWakeWord()
+        commandListener?.shutdown()
         recognizer?.destroy()
         model?.close()
         tts?.shutdown()
