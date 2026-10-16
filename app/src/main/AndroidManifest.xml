@@ -19,6 +19,7 @@
     </queries>
 
     <application
+        android:name=".App"
         android:label="Mio Assistente"
         android:icon="@android:drawable/ic_btn_speak_now"
         android:theme="@android:style/Theme.Material.Light"

@@ -8,7 +8,13 @@ import android.content.Intent
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action == Intent.ACTION_BOOT_COMPLETED) {
-            context.startForegroundService(Intent(context, WakeWordService::class.java))
+            // Android 14+ può vietare di avviare il microfono all'accensione: in quel caso si ignora.
+            try {
+                if (Settings.hermesUrl(context).isNotEmpty())
+                    context.startForegroundService(Intent(context, WakeWordService::class.java))
+            } catch (e: Throwable) {
+                App.log(context, "Avvio all'accensione non consentito: $e")
+            }
         }
     }
 }

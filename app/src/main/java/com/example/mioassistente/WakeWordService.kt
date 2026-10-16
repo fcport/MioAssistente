@@ -66,8 +66,9 @@ class WakeWordService : Service() {
                 }
                 model = Model(dir.absolutePath)
                 main.post { startWakeWord() }
-            } catch (e: Exception) {
+            } catch (e: Throwable) {
                 Log.e(TAG, "Errore caricamento modello", e)
+                App.log(this, "Errore modello: $e")
                 main.post {
                     updateNotification("Impossibile scaricare il modello: controlla la connessione e riavvia")
                 }
@@ -118,8 +119,7 @@ class WakeWordService : Service() {
         try {
             // Grammatica ristretta: Vosk sceglie solo tra la tua frase e "rumore",
             // così è veloce, leggero e poco soggetto a falsi allarmi.
-            val grammar = JSONArray().put(wakePhrase).put("[unk]").toString()
-            val rec = Recognizer(m, 16000f, grammar)
+            val rec = buildRecognizer(m)
             wakeListener = SpeechService(rec, 16000f).also {
                 it.startListening(object : org.vosk.android.RecognitionListener {
                     override fun onPartialResult(hyp: String?) = check(hyp, "partial")
@@ -130,15 +130,47 @@ class WakeWordService : Service() {
                 })
             }
             updateNotification("In ascolto di \"$wakePhrase\"…")
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             Log.e(TAG, "Errore avvio ascolto", e)
+            App.log(this, "Errore ascolto: $e")
             updateNotification("Errore: ${e.message}")
         }
     }
 
+    /** Normalizza: minuscolo, senza "h" (hermes = ermes, ehi = ei), spazi singoli. */
+    private fun norm(t: String) = t.lowercase().replace("h", "").replace(Regex("[^a-zàèéìòù ]"), " ")
+        .replace(Regex("\\s+"), " ").trim()
+
+    private val wakeNorm by lazy { norm(wakePhrase) }
+    private val wakeKey by lazy { wakeNorm.split(" ").last() }
+
+    /**
+     * Se tutte le parole della frase sono nel vocabolario del modello usa una grammatica ristretta
+     * (veloce, pochi falsi allarmi); altrimenti riconoscimento libero e confronto tollerante.
+     */
+    private fun buildRecognizer(m: Model): Recognizer {
+        val variants = linkedSetOf(wakePhrase, wakePhrase.replace("h", ""), wakePhrase.split(" ").last(),
+            wakePhrase.split(" ").last().replace("h", ""))
+        val usable = variants.filter { v ->
+            v.isNotBlank() && v.split(" ").all { w ->
+                try { m.findWord(w) >= 0 } catch (_: Throwable) { false }
+            }
+        }
+        App.log(this, "Frase: '$wakePhrase' - varianti nel vocabolario: $usable")
+        return if (usable.isNotEmpty()) {
+            val g = JSONArray(); usable.forEach { g.put(it) }; g.put("[unk]")
+            Recognizer(m, 16000f, g.toString())
+        } else {
+            Recognizer(m, 16000f)
+        }
+    }
+
     private fun check(hyp: String?, key: String) {
-        val text = hyp?.let { JSONObject(it).optString(key) } ?: return
-        if (text.contains(wakePhrase)) main.post { onWakeWord() }
+        val raw = try { hyp?.let { JSONObject(it).optString(key) } } catch (_: Throwable) { null } ?: return
+        val text = norm(raw)
+        if (text.isEmpty()) return
+        val hit = text.contains(wakeNorm) || (wakeKey.length >= 4 && text.split(" ").contains(wakeKey))
+        if (hit) { App.log(this, "Attivato da: '$raw'"); main.post { onWakeWord() } }
     }
 
     private fun onWakeWord() {
@@ -227,8 +259,9 @@ class WakeWordService : Service() {
                 }
             } catch (e: java.net.SocketTimeoutException) {
                 "Hermes ci sta mettendo troppo a rispondere."
-            } catch (e: Exception) {
+            } catch (e: Throwable) {
                 Log.e(TAG, "Errore Hermes", e)
+                App.log(this, "Errore Hermes: $e")
                 "Non riesco a raggiungere Hermes. Il computer è acceso e sulla stessa Wi-Fi?"
             }
             main.post { speak(reply) }
@@ -254,8 +287,10 @@ class WakeWordService : Service() {
     }
 
     private fun TextToSpeech.playEarcon() {
-        android.media.ToneGenerator(android.media.AudioManager.STREAM_NOTIFICATION, 80)
-            .startTone(android.media.ToneGenerator.TONE_PROP_BEEP, 150)
+        try {
+            android.media.ToneGenerator(android.media.AudioManager.STREAM_NOTIFICATION, 80)
+                .startTone(android.media.ToneGenerator.TONE_PROP_BEEP, 150)
+        } catch (_: Throwable) {}
     }
 
     // ---------- Notifica fissa (obbligatoria per ascoltare in background) ----------
@@ -265,10 +300,15 @@ class WakeWordService : Service() {
             NotificationChannel(CHANNEL, "Assistente", NotificationManager.IMPORTANCE_LOW)
         )
         val n = buildNotification("Avvio…")
-        if (Build.VERSION.SDK_INT >= 30) {
-            startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
-        } else {
-            startForeground(1, n)
+        try {
+            if (Build.VERSION.SDK_INT >= 30) {
+                startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+            } else {
+                startForeground(1, n)
+            }
+        } catch (e: Throwable) {
+            App.log(this, "startForeground fallito: $e")
+            throw e
         }
     }
 

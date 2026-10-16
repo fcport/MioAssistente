@@ -64,12 +64,45 @@ class MainActivity : Activity() {
             addView(label("Indirizzo del PC con Hermes")); addView(url)
             addView(label("Password di Hermes")); addView(key)
             addView(start); addView(stop)
+            addView(diagnostics())
         }
         setContentView(ScrollView(this).apply { addView(layout) })
 
         // Aperta come assistente predefinito (tasto accensione lungo): avvia subito.
         if (intent?.action == Intent.ACTION_ASSIST && Settings.hermesUrl(this).isNotEmpty()) {
             askPermissionsThenStart()
+        }
+    }
+
+    /** Mostra l'ultimo errore e il registro, con un pulsante per copiarli. */
+    private fun diagnostics(): LinearLayout {
+        val crash = java.io.File(filesDir, "ultimo_errore.txt")
+        val log = java.io.File(filesDir, "registro.txt")
+        val text = buildString {
+            if (crash.exists()) append("⚠️ ULTIMO ERRORE:\n").append(crash.readText()).append("\n\n")
+            if (log.exists()) append("REGISTRO:\n").append(log.readLines().takeLast(15).joinToString("\n"))
+        }
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            if (text.isBlank()) return@apply
+            addView(TextView(this@MainActivity).apply {
+                this.text = "Diagnostica"; textSize = 15f; setPadding(0, 48, 0, 4)
+            })
+            addView(TextView(this@MainActivity).apply {
+                this.text = text; textSize = 11f; setTextIsSelectable(true)
+            })
+            addView(Button(this@MainActivity).apply {
+                this.text = "Copia diagnostica"
+                setOnClickListener {
+                    val cm = getSystemService(android.content.ClipboardManager::class.java)
+                    cm.setPrimaryClip(android.content.ClipData.newPlainText("diagnostica", text))
+                    Toast.makeText(this@MainActivity, "Copiato: incollalo a Claude", Toast.LENGTH_SHORT).show()
+                }
+            })
+            addView(Button(this@MainActivity).apply {
+                this.text = "Cancella diagnostica"
+                setOnClickListener { crash.delete(); log.delete(); recreate() }
+            })
         }
     }
 
