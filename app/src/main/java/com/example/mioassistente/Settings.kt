@@ -14,15 +14,6 @@ object Settings {
     fun hermesUrl(c: Context) = p(c).getString("url", "") ?: ""
     fun hermesKey(c: Context) = p(c).getString("key", "") ?: ""
 
-    fun sttUrl(c: Context) = p(c).getString("stt", "") ?: ""
-
-    fun saveStt(c: Context, url: String) {
-        var u = url.trim()
-        if (u.isNotEmpty() && !u.startsWith("http")) u = "http://$u"
-        if (u.isNotEmpty() && Regex("^https?://[^/:]+/?$").matches(u)) u = u.trimEnd('/') + ":3901"
-        p(c).edit().putString("stt", u).apply()
-    }
-
     fun save(c: Context, frase: String, url: String, key: String) {
         var u = url.trim()
         if (u.isNotEmpty() && !u.startsWith("http")) u = "http://$u"

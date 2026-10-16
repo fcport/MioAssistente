@@ -37,17 +37,10 @@ class MainActivity : Activity() {
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
         }
 
-        val stt = EditText(this).apply {
-            setText(Settings.sttUrl(this@MainActivity))
-            hint = "facoltativo, es. 100.x.x.x:3901"
-            inputType = InputType.TYPE_TEXT_VARIATION_URI
-        }
-
         val start = Button(this).apply {
             text = "Salva e avvia assistente"
             setOnClickListener {
                 Settings.save(this@MainActivity, frase.text.toString(), url.text.toString(), key.text.toString())
-                Settings.saveStt(this@MainActivity, stt.text.toString())
                 if (Settings.hermesUrl(this@MainActivity).isEmpty()) {
                     Toast.makeText(this@MainActivity, "Inserisci l'indirizzo di Hermes", Toast.LENGTH_LONG).show()
                     return@setOnClickListener
@@ -73,7 +66,6 @@ class MainActivity : Activity() {
             addView(label("Frase di attivazione")); addView(frase)
             addView(label("Indirizzo del PC con Hermes")); addView(url)
             addView(label("Password di Hermes")); addView(key)
-            addView(label("Trascrizione con VoiceStudio sul PC")); addView(stt)
             addView(start); addView(stop)
             addView(diagnostics())
         }

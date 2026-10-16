@@ -95,6 +95,7 @@ class WakeWordService : Service() {
                 model = Model(dir.absolutePath)
                 App.log(this, "5. Modello caricato")
                 main.post { startWakeWord() }
+                prepareWhisper()
             } catch (e: Throwable) {
                 Log.e(TAG, "Errore caricamento modello", e)
                 App.log(this, "Errore modello (tentativo $attempt): $e")
@@ -258,7 +259,7 @@ class WakeWordService : Service() {
     // ---------- 2. Ascolto della frase ----------
     // ---------- 2. Ascolto della domanda ----------
     // Registra l'audio: il modello Vosk sul telefono decide quando hai finito di parlare e fa da riserva;
-    // se è configurato VoiceStudio sul PC, l'audio viene trascritto lì (capisce anche parole inventate).
+    // la domanda viene poi trascritta da Whisper sul telefono (capisce anche parole inventate).
     @Volatile private var recording = false
 
     private fun listenForCommand() {
@@ -275,11 +276,11 @@ class WakeWordService : Service() {
             }
             recording = false
             var text = voskText
-            val stt = Settings.sttUrl(this)
-            if (stt.isNotEmpty() && pcm.size > 16000) { // almeno mezzo secondo di audio
+            val ctx = whisperCtx
+            if (ctx != 0L && pcm.size > 8000) { // almeno un quarto di secondo di audio
                 main.post { updateNotification("Trascrivo…") }
-                val w = try { transcribeRemote(stt, pcm) } catch (e: Throwable) {
-                    App.log(this, "VoiceStudio non raggiungibile ($e): uso il modello del telefono"); null
+                val w = try { transcribeLocal(ctx, pcm) } catch (e: Throwable) {
+                    App.log(this, "Errore Whisper: $e"); null
                 }
                 if (!w.isNullOrBlank()) text = w
             }
@@ -357,46 +358,79 @@ class WakeWordService : Service() {
         return t to out.toByteArray()
     }
 
-    /** Invia l'audio a VoiceStudio (API compatibile OpenAI /v1/audio/transcriptions). */
-    private fun transcribeRemote(base: String, pcm: ByteArray): String? {
-        val wav = pcmToWav(pcm, 16000)
-        val boundary = "----MioAssistente" + System.currentTimeMillis()
-        val conn = URL("${base.trimEnd('/')}/v1/audio/transcriptions").openConnection() as HttpURLConnection
-        conn.requestMethod = "POST"
-        conn.connectTimeout = 5_000
-        conn.readTimeout = 60_000
-        conn.doOutput = true
-        conn.setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
-        conn.outputStream.use { o ->
-            fun field(name: String, value: String) {
-                o.write("--$boundary\r\nContent-Disposition: form-data; name=\"$name\"\r\n\r\n$value\r\n".toByteArray())
+    // ---------- Whisper sul telefono ----------
+    @Volatile private var whisperCtx = 0L
+    private val whisperFile by lazy { File(filesDir, "whisper/" + Config.WHISPER_MODEL_NAME) }
+
+    /** Scarica (la prima volta) e carica il modello Whisper. Finché non è pronto si usa Vosk. */
+    private fun prepareWhisper() {
+        if (whisperCtx != 0L) return
+        if (!Whisper.available) { App.log(this, "Whisper: libreria non disponibile"); return }
+        Thread {
+            try {
+                val f = whisperFile
+                if (!File(f.parentFile, ".ok").exists() || f.length() < Config.WHISPER_MODEL_MIN_BYTES) {
+                    App.log(this, "W1. Scarico il modello Whisper (~190 MB)…")
+                    f.parentFile?.deleteRecursively(); f.parentFile?.mkdirs()
+                    val tmp = File(f.parentFile, "download.tmp")
+                    val conn = URL(Config.WHISPER_MODEL_URL).openConnection() as HttpURLConnection
+                    conn.instanceFollowRedirects = true
+                    conn.connectTimeout = 15_000; conn.readTimeout = 60_000
+                    if (conn.responseCode != 200) throw java.io.IOException("HTTP ${conn.responseCode}")
+                    val total = conn.contentLengthLong
+                    var read = 0L; var last = -1
+                    conn.inputStream.use { input -> tmp.outputStream().use { out ->
+                        val buf = ByteArray(256 * 1024)
+                        while (true) {
+                            val n = input.read(buf); if (n < 0) break
+                            out.write(buf, 0, n); read += n
+                            if (total > 0) {
+                                val pct = (read * 100 / total).toInt()
+                                if (pct != last && pct % 10 == 0) {
+                                    last = pct
+                                    if (!recording && wakeListener != null) main.post {
+                                        updateNotification("In ascolto di \"$wakePhrase\"… (preparo il riconoscimento avanzato $pct%)")
+                                    }
+                                }
+                            }
+                        }
+                    } }
+                    if (total > 0 && read < total) throw java.io.IOException("download interrotto ($read su $total)")
+                    if (!tmp.renameTo(f)) throw java.io.IOException("impossibile salvare il modello")
+                    File(f.parentFile, ".ok").writeText("ok")
+                    App.log(this, "W2. Modello Whisper scaricato (${f.length() / 1_000_000} MB)")
+                }
+                val t0 = System.currentTimeMillis()
+                val ctx = Whisper.nativeInit(f.absolutePath)
+                if (ctx == 0L) {
+                    App.log(this, "Whisper: modello non valido, lo riscarico al prossimo avvio")
+                    f.parentFile?.deleteRecursively()
+                    return@Thread
+                }
+                whisperCtx = ctx
+                App.log(this, "W3. Whisper pronto (${System.currentTimeMillis() - t0} ms)")
+                main.post { if (!recording && wakeListener != null) updateNotification("In ascolto di \"$wakePhrase\"…") }
+            } catch (e: Throwable) {
+                App.log(this, "Whisper non disponibile per ora ($e): uso il modello base")
             }
-            field("model", "whisper-1")
-            field("language", "it")
-            field("response_format", "json")
-            o.write(("--$boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"domanda.wav\"\r\n" +
-                "Content-Type: audio/wav\r\n\r\n").toByteArray())
-            o.write(wav)
-            o.write("\r\n--$boundary--\r\n".toByteArray())
-        }
-        val code = conn.responseCode
-        val body = (if (code in 200..299) conn.inputStream else conn.errorStream)?.bufferedReader()?.readText() ?: ""
-        if (code !in 200..299) {
-            App.log(this, "VoiceStudio errore HTTP $code: ${body.take(200)}")
-            return null
-        }
-        val text = try { JSONObject(body).optString("text") } catch (_: Throwable) { body }
-        App.log(this, "VoiceStudio ha capito: '$text'")
-        return text
+        }.start()
     }
 
-    private fun pcmToWav(pcm: ByteArray, rate: Int): ByteArray {
-        val bb = java.nio.ByteBuffer.allocate(44 + pcm.size).order(java.nio.ByteOrder.LITTLE_ENDIAN)
-        bb.put("RIFF".toByteArray()); bb.putInt(36 + pcm.size); bb.put("WAVE".toByteArray())
-        bb.put("fmt ".toByteArray()); bb.putInt(16); bb.putShort(1); bb.putShort(1)
-        bb.putInt(rate); bb.putInt(rate * 2); bb.putShort(2); bb.putShort(16)
-        bb.put("data".toByteArray()); bb.putInt(pcm.size); bb.put(pcm)
-        return bb.array()
+    private fun transcribeLocal(ctx: Long, pcm: ByteArray): String? {
+        val n = pcm.size / 2
+        val audio = FloatArray(n)
+        val bb = java.nio.ByteBuffer.wrap(pcm).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+        for (i in 0 until n) audio[i] = bb.getShort(i * 2) / 32768f
+        // contesto audio proporzionale alla durata: molto più veloce per frasi brevi
+        val seconds = n / 16000.0
+        val audioCtx = minOf(1500, (seconds * 50).toInt() + 128)
+        val threads = Runtime.getRuntime().availableProcessors().coerceIn(2, 6)
+        val t0 = System.currentTimeMillis()
+        val raw = Whisper.nativeTranscribe(ctx, audio, threads, audioCtx) ?: return null
+        // togli annotazioni tipo [Musica] o (risate) che Whisper aggiunge sul silenzio
+        val text = raw.replace(Regex("[\\[(][^\\])]*[\\])]"), " ").replace(Regex("\\s+"), " ").trim()
+        App.log(this, "Whisper ha capito: '$text' (${System.currentTimeMillis() - t0} ms)")
+        return text
     }
 
     private fun parse(hyp: String?, key: String): String =
@@ -533,6 +567,7 @@ class WakeWordService : Service() {
         stopWakeWord()
         recording = false
         recognizer?.destroy()
+        if (whisperCtx != 0L) { Whisper.nativeFree(whisperCtx); whisperCtx = 0L }
         model?.close()
         tts?.shutdown()
         super.onDestroy()

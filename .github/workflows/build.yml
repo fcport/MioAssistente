@@ -22,11 +22,17 @@ jobs:
         with:
           gradle-version: "8.9"
 
+      - name: Scarica whisper.cpp
+        run: |
+          git clone --depth 1 --branch v1.7.6 https://github.com/ggml-org/whisper.cpp app/src/main/cpp/whisper.cpp \
+            || git clone --depth 1 https://github.com/ggml-org/whisper.cpp app/src/main/cpp/whisper.cpp
+          ls $ANDROID_HOME/ndk || true
+
       - name: Compila l'app
         run: |
           set -o pipefail
           gradle assembleDebug --no-daemon 2>&1 | tee build.log || {
-            grep -E "^e: |What went wrong" -A4 build.log | head -40 | while IFS= read -r l; do echo "::error::$l"; done
+            grep -E "^e: |What went wrong|error:|CMake Error" -A4 build.log | head -60 | while IFS= read -r l; do echo "::error::$l"; done
             exit 1
           }
 

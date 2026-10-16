@@ -14,7 +14,12 @@ android {
         val run = (System.getenv("GITHUB_RUN_NUMBER") ?: "1").toInt()
         versionCode = run
         versionName = "1.$run"
+        ndk { abiFilters += listOf("arm64-v8a") }
+        externalNativeBuild { cmake { arguments += listOf("-DCMAKE_BUILD_TYPE=Release") } }
     }
+
+    ndkVersion = "27.2.12479018"
+    externalNativeBuild { cmake { path = file("src/main/cpp/CMakeLists.txt") } }
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
