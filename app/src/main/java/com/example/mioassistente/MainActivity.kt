@@ -139,7 +139,11 @@ class MainActivity : Activity() {
             open(Intent(android.provider.Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
         }
         row("Voce italiana di Google", hasGoogleTts()) {
-            open(Intent(Intent.ACTION_VIEW, Uri.parse("market://details?id=com.google.android.tts")))
+            // apri proprio il Play Store di Google (sugli Xiaomi "market://" apre GetApps)
+            val play = Intent(Intent.ACTION_VIEW, Uri.parse("market://details?id=com.google.android.tts"))
+                .setPackage("com.android.vending")
+            if (!open(play, quiet = true))
+                open(Intent(Intent.ACTION_VIEW, Uri.parse("https://play.google.com/store/apps/details?id=com.google.android.tts")))
         }
         if (isXiaomi()) {
             row("Xiaomi: avvio automatico (attivalo)", null) {
