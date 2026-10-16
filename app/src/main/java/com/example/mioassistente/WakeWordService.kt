@@ -153,7 +153,12 @@ class WakeWordService : Service() {
             wakePhrase.split(" ").last().replace("h", ""))
         val usable = variants.filter { v ->
             v.isNotBlank() && v.split(" ").all { w ->
-                try { m.findWord(w) >= 0 } catch (_: Throwable) { false }
+                try {
+                    // findWord può non esistere in tutte le versioni di Vosk: in quel caso
+                    // si usa il riconoscimento libero.
+                    val f = m.javaClass.methods.firstOrNull { it.name == "findWord" }
+                    f != null && (f.invoke(m, w) as Int) >= 0
+                } catch (_: Throwable) { false }
             }
         }
         App.log(this, "Frase: '$wakePhrase' - varianti nel vocabolario: $usable")
