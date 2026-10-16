@@ -11,8 +11,9 @@ android {
         applicationId = "com.example.mioassistente"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0"
+        val run = (System.getenv("GITHUB_RUN_NUMBER") ?: "1").toInt()
+        versionCode = run
+        versionName = "1.$run"
     }
 
     compileOptions {
@@ -20,6 +21,7 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
     kotlinOptions { jvmTarget = "17" }
+    buildFeatures { buildConfig = true }
 
     // I file del modello Vosk non vanno compressi nell'APK
     androidResources { noCompress += listOf("mdl", "fst", "conf", "int", "mat") }

@@ -60,6 +60,9 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setPadding(48, 96, 48, 48)
             addView(TextView(this@MainActivity).apply { text = "Mio Assistente"; textSize = 24f })
+            addView(TextView(this@MainActivity).apply {
+                text = "Versione ${BuildConfig.VERSION_NAME}"; textSize = 13f
+            })
             addView(label("Frase di attivazione")); addView(frase)
             addView(label("Indirizzo del PC con Hermes")); addView(url)
             addView(label("Password di Hermes")); addView(key)
@@ -84,12 +87,12 @@ class MainActivity : Activity() {
         }
         return LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            if (text.isBlank()) return@apply
             addView(TextView(this@MainActivity).apply {
                 this.text = "Diagnostica"; textSize = 15f; setPadding(0, 48, 0, 4)
             })
             addView(TextView(this@MainActivity).apply {
-                this.text = text; textSize = 11f; setTextIsSelectable(true)
+                this.text = text.ifBlank { "Nessun evento registrato finora." }
+                textSize = 11f; setTextIsSelectable(true)
             })
             addView(Button(this@MainActivity).apply {
                 this.text = "Copia diagnostica"
