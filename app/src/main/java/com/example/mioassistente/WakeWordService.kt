@@ -256,77 +256,151 @@ class WakeWordService : Service() {
     }
 
     // ---------- 2. Ascolto della frase ----------
-    // Ascolto della domanda con il modello italiano Vosk (offline, sempre in italiano).
-    private var commandListener: SpeechService? = null
-    private var commandDone = false
-    private val heard = StringBuilder()
-    private val finishCommand = Runnable { completeCommand() }
+    // ---------- 2. Ascolto della domanda ----------
+    // Registra l'audio: il modello Vosk sul telefono decide quando hai finito di parlare e fa da riserva;
+    // se è configurato VoiceStudio sul PC, l'audio viene trascritto lì (capisce anche parole inventate).
+    @Volatile private var recording = false
 
     private fun listenForCommand() {
         val m = model ?: run { startWakeWord(); return }
-        commandDone = false
-        heard.clear()
-        try {
-            val rec = Recognizer(m, 16000f)
-            commandListener = SpeechService(rec, 16000f).also {
-                it.startListening(object : org.vosk.android.RecognitionListener {
-                    override fun onPartialResult(hyp: String?) {
-                        val p = parse(hyp, "partial")
-                        if (p.isNotBlank()) {
-                            // sta ancora parlando: rimanda la chiusura
-                            main.removeCallbacks(finishCommand)
-                            main.postDelayed(finishCommand, 2_500)
-                            updateNotification("… ${(heard.toString() + " " + p).trim()}")
-                        }
-                    }
-                    override fun onResult(hyp: String?) {
-                        val t = parse(hyp, "text")
-                        if (t.isNotBlank()) {
-                            heard.append(' ').append(t)
-                            // aspetta un attimo: se non dici altro, invia
-                            main.removeCallbacks(finishCommand)
-                            main.postDelayed(finishCommand, 1_200)
-                        }
-                    }
-                    override fun onFinalResult(hyp: String?) {
-                        val t = parse(hyp, "text")
-                        if (t.isNotBlank()) heard.append(' ').append(t)
-                        main.post { completeCommand() }
-                    }
-                    override fun onError(e: Exception?) {
-                        App.log(this@WakeWordService, "Errore ascolto domanda: $e")
-                        main.post { completeCommand() }
-                    }
-                    override fun onTimeout() { main.post { completeCommand() } }
-                }, 15_000) // massimo 15 secondi per la domanda
+        recording = true
+        Thread {
+            var voskText = ""
+            var pcm = ByteArray(0)
+            try {
+                val r = recordCommand(m)
+                voskText = r.first; pcm = r.second
+            } catch (e: Throwable) {
+                App.log(this, "Errore registrazione domanda: $e")
             }
-            // se non dici nulla entro 6 secondi, torna in attesa di "ehi hermes"
-            main.postDelayed(finishCommand, 6_000)
-        } catch (e: Throwable) {
-            App.log(this, "Errore avvio ascolto domanda: $e")
-            startWakeWord()
+            recording = false
+            var text = voskText
+            val stt = Settings.sttUrl(this)
+            if (stt.isNotEmpty() && pcm.size > 16000) { // almeno mezzo secondo di audio
+                main.post { updateNotification("Trascrivo…") }
+                val w = try { transcribeRemote(stt, pcm) } catch (e: Throwable) {
+                    App.log(this, "VoiceStudio non raggiungibile ($e): uso il modello del telefono"); null
+                }
+                if (!w.isNullOrBlank()) text = w
+            }
+            // togli l'eventuale frase di attivazione ripetuta all'inizio
+            val words = text.trim().split(Regex("\\s+"))
+            val n = wakePhrase.split(" ").size
+            if (words.size >= n && norm(words.take(n).joinToString(" ")) == norm(wakePhrase)) {
+                text = words.drop(n).joinToString(" ")
+            }
+            text = text.trim().trim(',', '.', ' ')
+            main.post {
+                if (text.isBlank()) { App.log(this, "Nessuna domanda sentita"); startWakeWord() }
+                else askAgent(text)
+            }
+        }.start()
+    }
+
+    /** Registra finché parli (si ferma dopo ~1,5 s di silenzio). Ritorna testo Vosk + audio PCM 16 kHz. */
+    private fun recordCommand(m: Model): Pair<String, ByteArray> {
+        val rate = 16000
+        val min = android.media.AudioRecord.getMinBufferSize(rate,
+            android.media.AudioFormat.CHANNEL_IN_MONO, android.media.AudioFormat.ENCODING_PCM_16BIT)
+        @Suppress("MissingPermission")
+        val ar = android.media.AudioRecord(android.media.MediaRecorder.AudioSource.VOICE_RECOGNITION, rate,
+            android.media.AudioFormat.CHANNEL_IN_MONO, android.media.AudioFormat.ENCODING_PCM_16BIT,
+            maxOf(min, 8192) * 2)
+        val rec = Recognizer(m, rate.toFloat())
+        val out = java.io.ByteArrayOutputStream()
+        val text = StringBuilder()
+        val buf = ByteArray(3200) // 100 ms
+        val start = System.currentTimeMillis()
+        var lastSpeech = 0L
+        var heardAny = false
+        var lastPartial = ""
+        ar.startRecording()
+        try {
+            while (recording) {
+                val n = ar.read(buf, 0, buf.size)
+                if (n <= 0) continue
+                out.write(buf, 0, n)
+                val now = System.currentTimeMillis()
+                // volume: se c'è voce, aggiorna l'ultimo istante di parlato
+                var sum = 0.0
+                var i = 0
+                while (i + 1 < n) {
+                    val v = ((buf[i + 1].toInt() shl 8) or (buf[i].toInt() and 0xff)).toShort().toDouble()
+                    sum += v * v; i += 2
+                }
+                val rms = Math.sqrt(sum / (n / 2).coerceAtLeast(1))
+                if (rms > 900) { lastSpeech = now; heardAny = true }
+                if (rec.acceptWaveForm(buf, n)) {
+                    val t = parse(rec.result, "text")
+                    if (t.isNotBlank()) { text.append(' ').append(t); lastSpeech = now; heardAny = true }
+                } else {
+                    val p = parse(rec.partialResult, "partial")
+                    if (p.isNotBlank() && p != lastPartial) {
+                        lastPartial = p; lastSpeech = now; heardAny = true
+                        val shown = (text.toString() + " " + p).trim()
+                        main.post { updateNotification("… $shown") }
+                    }
+                }
+                val elapsed = now - start
+                if (!heardAny && elapsed > 6_000) break          // non hai detto nulla
+                if (heardAny && now - lastSpeech > 1_500) break  // hai finito di parlare
+                if (elapsed > 20_000) break                       // massimo 20 secondi
+            }
+        } finally {
+            try { ar.stop() } catch (_: Throwable) {}
+            ar.release()
         }
+        text.append(' ').append(parse(rec.finalResult, "text"))
+        rec.close()
+        val t = text.toString().trim()
+        App.log(this, "Modello telefono ha capito: '$t'")
+        return t to out.toByteArray()
+    }
+
+    /** Invia l'audio a VoiceStudio (API compatibile OpenAI /v1/audio/transcriptions). */
+    private fun transcribeRemote(base: String, pcm: ByteArray): String? {
+        val wav = pcmToWav(pcm, 16000)
+        val boundary = "----MioAssistente" + System.currentTimeMillis()
+        val conn = URL("${base.trimEnd('/')}/v1/audio/transcriptions").openConnection() as HttpURLConnection
+        conn.requestMethod = "POST"
+        conn.connectTimeout = 5_000
+        conn.readTimeout = 60_000
+        conn.doOutput = true
+        conn.setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
+        conn.outputStream.use { o ->
+            fun field(name: String, value: String) {
+                o.write("--$boundary\r\nContent-Disposition: form-data; name=\"$name\"\r\n\r\n$value\r\n".toByteArray())
+            }
+            field("model", "whisper-1")
+            field("language", "it")
+            field("response_format", "json")
+            o.write(("--$boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"domanda.wav\"\r\n" +
+                "Content-Type: audio/wav\r\n\r\n").toByteArray())
+            o.write(wav)
+            o.write("\r\n--$boundary--\r\n".toByteArray())
+        }
+        val code = conn.responseCode
+        val body = (if (code in 200..299) conn.inputStream else conn.errorStream)?.bufferedReader()?.readText() ?: ""
+        if (code !in 200..299) {
+            App.log(this, "VoiceStudio errore HTTP $code: ${body.take(200)}")
+            return null
+        }
+        val text = try { JSONObject(body).optString("text") } catch (_: Throwable) { body }
+        App.log(this, "VoiceStudio ha capito: '$text'")
+        return text
+    }
+
+    private fun pcmToWav(pcm: ByteArray, rate: Int): ByteArray {
+        val bb = java.nio.ByteBuffer.allocate(44 + pcm.size).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+        bb.put("RIFF".toByteArray()); bb.putInt(36 + pcm.size); bb.put("WAVE".toByteArray())
+        bb.put("fmt ".toByteArray()); bb.putInt(16); bb.putShort(1); bb.putShort(1)
+        bb.putInt(rate); bb.putInt(rate * 2); bb.putShort(2); bb.putShort(16)
+        bb.put("data".toByteArray()); bb.putInt(pcm.size); bb.put(pcm)
+        return bb.array()
     }
 
     private fun parse(hyp: String?, key: String): String =
         try { hyp?.let { JSONObject(it).optString(key) } ?: "" } catch (_: Throwable) { "" }
-
-    private fun completeCommand() {
-        if (commandDone) return
-        commandDone = true
-        main.removeCallbacks(finishCommand)
-        commandListener?.stop(); commandListener?.shutdown(); commandListener = null
-        // togli l'eventuale frase di attivazione ripetuta all'inizio
-        var text = heard.toString().trim()
-        val wn = norm(wakePhrase)
-        if (norm(text).startsWith(wn)) text = text.split(" ").drop(wakePhrase.split(" ").size).joinToString(" ")
-        if (text.isBlank()) {
-            App.log(this, "Nessuna domanda sentita")
-            startWakeWord()
-        } else {
-            askAgent(text)
-        }
-    }
 
     /** Usa il riconoscimento vocale di Google se presente (quello Xiaomi può essere in cinese). */
     private fun createItalianRecognizer(): SpeechRecognizer {
@@ -457,7 +531,7 @@ class WakeWordService : Service() {
 
     override fun onDestroy() {
         stopWakeWord()
-        commandListener?.shutdown()
+        recording = false
         recognizer?.destroy()
         model?.close()
         tts?.shutdown()
