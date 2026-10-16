@@ -37,8 +37,44 @@ class PhoneActions(private val ctx: Context) {
 
     fun needsConfirmation(a: JSONObject) = a.optString("tipo") in setOf("chiama", "sms", "whatsapp")
 
+    /**
+     * Prima della conferma: trova il numero esatto. Ritorna una frase da dire se non si può procedere
+     * (contatto non trovato o ambiguo), altrimenti null e salva nome/numero nell'azione.
+     */
+    fun prepare(a: JSONObject): String? = try {
+        val who = a.optString("contatto").trim()
+        val digits = who.filter { it.isDigit() || it == '+' }
+        if (digits.count { it.isDigit() } >= 5) {
+            a.put("_nome", who); a.put("_num", digits); null
+        } else {
+            if (ctx.checkSelfPermission(Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED) {
+                "Non posso leggere la rubrica: concedimi il permesso da Configura telefono."
+            } else {
+                val list = contacts(who)
+                val exact = list.filter { it.first.equals(who, ignoreCase = true) }
+                val chosen = when {
+                    exact.size == 1 -> exact[0]
+                    list.size == 1 -> list[0]
+                    else -> null
+                }
+                when {
+                    list.isEmpty() -> "Non trovo $who in rubrica."
+                    chosen == null -> "Ho trovato più contatti: " + list.take(4).joinToString(", ") { it.first } +
+                        ". Ripeti la richiesta con il nome completo."
+                    else -> { a.put("_nome", chosen.first); a.put("_num", chosen.second); null }
+                }
+            }
+        }
+    } catch (e: Throwable) {
+        App.log(ctx, "Errore ricerca contatto: $e"); "Non riesco a cercare il contatto."
+    }
+
+    /** Ultime cifre del numero lette una per una, per capire a chi si sta per scrivere. */
+    private fun lastDigits(num: String) = num.filter { it.isDigit() }.takeLast(3).toList().joinToString(" ")
+
     fun confirmationQuestion(a: JSONObject): String {
-        val chi = a.optString("contatto")
+        val nome = a.optString("_nome", a.optString("contatto"))
+        val chi = if (a.has("_num")) "$nome, numero che finisce con ${lastDigits(a.getString("_num"))}" else nome
         val testo = a.optString("testo")
         return when (a.optString("tipo")) {
             "chiama" -> "Chiamo $chi. Confermi?"
@@ -119,10 +155,16 @@ conferma; procedi solo dopo un sì esplicito dell'utente nel messaggio successiv
 
     // ---------- azioni ----------
 
-    private fun start(i: Intent): Boolean = try {
-        ctx.startActivity(i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)); true
-    } catch (e: Throwable) {
-        App.log(ctx, "Impossibile aprire ${i.action}: $e"); false
+    private fun start(i: Intent): Boolean {
+        if (!android.provider.Settings.canDrawOverlays(ctx)) {
+            App.log(ctx, "Manca il permesso 'mostra sopra altre app': non posso aprire ${i.action}")
+            return false
+        }
+        return try {
+            ctx.startActivity(i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)); true
+        } catch (e: Throwable) {
+            App.log(ctx, "Impossibile aprire ${i.action}: $e"); false
+        }
     }
 
     private val popupHint = "Non riesco ad aprirlo da qui: concedimi il permesso di mostrarmi sopra le altre app, da Configura telefono."
@@ -186,6 +228,9 @@ conferma; procedi solo dopo un sì esplicito dell'utente nel messaggio successiv
     }
 
     /** Trova il numero: se è già un numero lo usa, altrimenti cerca in rubrica. */
+    private fun resolved(a: JSONObject): Pair<String, String>? =
+        if (a.has("_num")) a.optString("_nome") to a.getString("_num") else resolveNumber(a.optString("contatto"))
+
     private fun resolveNumber(who: String): Pair<String, String>? {
         val digits = who.filter { it.isDigit() || it == '+' }
         if (digits.count { it.isDigit() } >= 5) return who to digits
@@ -219,15 +264,19 @@ conferma; procedi solo dopo un sì esplicito dell'utente nel messaggio successiv
     }
 
     private fun call(a: JSONObject): Result {
-        val (name, num) = resolveNumber(a.optString("contatto")) ?: return Result(spoken = "Non trovo questo contatto in rubrica.")
+        val (name, num) = resolved(a) ?: return Result(spoken = "Non trovo questo contatto in rubrica.")
         val canCall = ctx.checkSelfPermission(Manifest.permission.CALL_PHONE) == PackageManager.PERMISSION_GRANTED
-        val i = Intent(if (canCall) Intent.ACTION_CALL else Intent.ACTION_DIAL, Uri.parse("tel:$num"))
         App.log(ctx, "Chiamo $name ($num)")
-        return if (start(i)) Result() else Result(spoken = popupHint)
+        if (canCall) {
+            ctx.getSystemService(android.telecom.TelecomManager::class.java).placeCall(Uri.parse("tel:$num"), null)
+            return Result()
+        }
+        return if (start(Intent(Intent.ACTION_DIAL, Uri.parse("tel:$num")))) Result()
+        else Result(spoken = "Mi manca il permesso per telefonare: attivalo da Configura telefono.")
     }
 
     private fun sms(a: JSONObject): Result {
-        val (name, num) = resolveNumber(a.optString("contatto")) ?: return Result(spoken = "Non trovo questo contatto in rubrica.")
+        val (name, num) = resolved(a) ?: return Result(spoken = "Non trovo questo contatto in rubrica.")
         val text = a.optString("testo")
         if (text.isBlank()) return Result(spoken = "Il messaggio è vuoto.")
         @Suppress("DEPRECATION")
@@ -238,7 +287,7 @@ conferma; procedi solo dopo un sì esplicito dell'utente nel messaggio successiv
     }
 
     private fun whatsapp(a: JSONObject): Result {
-        val (_, raw) = resolveNumber(a.optString("contatto")) ?: return Result(spoken = "Non trovo questo contatto in rubrica.")
+        val (_, raw) = resolved(a) ?: return Result(spoken = "Non trovo questo contatto in rubrica.")
         var num = raw.filter { it.isDigit() }
         if (raw.startsWith("00")) num = num.drop(2)
         else if (!raw.startsWith("+") && num.length == 10 && num.startsWith("3")) num = "39$num" // cellulare italiano

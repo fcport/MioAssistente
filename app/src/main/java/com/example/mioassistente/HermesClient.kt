@@ -102,7 +102,16 @@ class Segmenter {
             parseAction(buf.substring(s + 2, e))?.let { actions += it }
             buf.delete(s, e + 2)
         }
-        val open = buf.indexOf("[[")
+        var open = buf.indexOf("[[")
+        if (final && open >= 0) {
+            // comando scritto male (es. una sola "]"): prova a recuperarlo e non perdere il testo dopo
+            val rest = buf.substring(open + 2)
+            parseAction(rest)?.let { actions += it }
+            val b = rest.lastIndexOf('}')
+            val tail = if (b >= 0) rest.substring(b + 1).trimStart(']', ' ') else rest
+            buf.setLength(open); buf.append(' ').append(tail)
+            open = -1
+        }
         val limit = if (open >= 0) open else buf.length
         var cut = 0
         if (final) {
@@ -116,7 +125,6 @@ class Segmenter {
         }
         val chunk = buf.substring(0, cut)
         buf.delete(0, cut)
-        if (final) buf.setLength(0) // un comando lasciato a metà viene scartato
         val clean = clean(chunk)
         return (if (clean.isNotBlank()) listOf(clean) else emptyList<String>()) to actions
     }
