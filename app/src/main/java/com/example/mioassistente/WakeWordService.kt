@@ -39,15 +39,19 @@ class WakeWordService : Service() {
     private var model: Model? = null
     private var wakeListener: SpeechService? = null
     private var recognizer: SpeechRecognizer? = null
-    private lateinit var tts: TextToSpeech
+    private var tts: TextToSpeech? = null
+    private var ttsReady = false
     private val main = Handler(Looper.getMainLooper())
     private val wakePhrase by lazy { Settings.wakePhrase(this).lowercase().trim() }
 
     override fun onCreate() {
         super.onCreate()
         startAsForeground()
-        tts = TextToSpeech(this) { tts.language = Locale.ITALIAN }
-        tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+        // Il callback può arrivare subito (anche prima che "tts" sia assegnato): lo gestiamo dopo.
+        tts = TextToSpeech(this) { status ->
+            main.post { onTtsInit(status) }
+        }
+        tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
             override fun onStart(id: String?) {}
             override fun onError(id: String?) { main.post { startWakeWord() } }
             override fun onDone(id: String?) { main.post { startWakeWord() } }
@@ -115,6 +119,16 @@ class WakeWordService : Service() {
                     out.outputStream().use { zip.copyTo(it) }
                 }
             }
+        }
+    }
+
+    private fun onTtsInit(status: Int) {
+        ttsReady = status == TextToSpeech.SUCCESS
+        if (ttsReady) {
+            val r = try { tts?.setLanguage(Locale.ITALIAN) } catch (_: Throwable) { null }
+            App.log(this, "Voce pronta (italiano: ${r != null && r >= 0})")
+        } else {
+            App.log(this, "Motore vocale non disponibile (stato $status): le risposte compariranno solo nella notifica")
         }
     }
 
@@ -190,7 +204,7 @@ class WakeWordService : Service() {
         if (wakeListener == null) return // già scattato
         stopWakeWord() // libera il microfono per il riconoscimento della frase
         updateNotification("Ti ascolto…")
-        tts.playEarcon() // piccolo segnale (vedi estensione in fondo)
+        playEarcon() // piccolo segnale
         listenForCommand()
     }
 
@@ -284,7 +298,10 @@ class WakeWordService : Service() {
     // ---------- 4. Risposta a voce ----------
     private fun speak(text: String) {
         updateNotification(text)
-        tts.speak(text, TextToSpeech.QUEUE_FLUSH, null, "reply")
+        val ok = ttsReady && try {
+            tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "reply") == TextToSpeech.SUCCESS
+        } catch (_: Throwable) { false }
+        if (!ok) startWakeWord() // senza voce: risposta solo in notifica, poi torna in ascolto
     }
 
     // ---------- Utilità ----------
@@ -299,7 +316,7 @@ class WakeWordService : Service() {
         }
     }
 
-    private fun TextToSpeech.playEarcon() {
+    private fun playEarcon() {
         try {
             android.media.ToneGenerator(android.media.AudioManager.STREAM_NOTIFICATION, 80)
                 .startTone(android.media.ToneGenerator.TONE_PROP_BEEP, 150)
@@ -341,7 +358,7 @@ class WakeWordService : Service() {
         stopWakeWord()
         recognizer?.destroy()
         model?.close()
-        tts.shutdown()
+        tts?.shutdown()
         super.onDestroy()
     }
 
