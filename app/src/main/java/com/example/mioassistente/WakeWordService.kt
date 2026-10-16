@@ -57,14 +57,19 @@ class WakeWordService : Service() {
         Thread {
             try {
                 val dir = File(filesDir, "vosk-model")
+                App.log(this, "1. Servizio avviato (Android ${Build.VERSION.SDK_INT}, ${Build.MANUFACTURER} ${Build.MODEL})")
                 if (!File(dir, ".ok").exists()) {
+                    App.log(this, "2. Modello assente: inizio download")
                     dir.deleteRecursively()
                     val inAssets = !assets.list(Config.VOSK_MODEL_ASSET_DIR).isNullOrEmpty()
                     if (inAssets) copyAssetDir(Config.VOSK_MODEL_ASSET_DIR, dir)
                     else downloadModel(dir)
                     File(dir, ".ok").writeText("ok")
+                    App.log(this, "3. Modello scaricato ed estratto")
                 }
+                App.log(this, "4. Carico il modello in memoria…")
                 model = Model(dir.absolutePath)
+                App.log(this, "5. Modello caricato")
                 main.post { startWakeWord() }
             } catch (e: Throwable) {
                 Log.e(TAG, "Errore caricamento modello", e)
@@ -119,16 +124,19 @@ class WakeWordService : Service() {
         try {
             // Grammatica ristretta: Vosk sceglie solo tra la tua frase e "rumore",
             // così è veloce, leggero e poco soggetto a falsi allarmi.
+            App.log(this, "6. Preparo il riconoscitore…")
             val rec = buildRecognizer(m)
+            App.log(this, "7. Avvio microfono…")
             wakeListener = SpeechService(rec, 16000f).also {
                 it.startListening(object : org.vosk.android.RecognitionListener {
                     override fun onPartialResult(hyp: String?) = check(hyp, "partial")
                     override fun onResult(hyp: String?) = check(hyp, "text")
                     override fun onFinalResult(hyp: String?) = check(hyp, "text")
-                    override fun onError(e: Exception?) { Log.e(TAG, "Vosk", e) }
+                    override fun onError(e: Exception?) { Log.e(TAG, "Vosk", e); App.log(this@WakeWordService, "Errore Vosk: $e") }
                     override fun onTimeout() {}
                 })
             }
+            App.log(this, "8. In ascolto")
             updateNotification("In ascolto di \"$wakePhrase\"…")
         } catch (e: Throwable) {
             Log.e(TAG, "Errore avvio ascolto", e)
