@@ -56,30 +56,54 @@ class WakeWordService : Service() {
             override fun onError(id: String?) { main.post { startWakeWord() } }
             override fun onDone(id: String?) { main.post { startWakeWord() } }
         })
+        loadModel(attempt = 1)
+    }
+
+    private var modelResetDone = false
+    private val modelDir by lazy { File(filesDir, "vosk-model") }
+
+    /** Il modello è completo solo se ci sono i file essenziali. */
+    private fun modelLooksComplete(dir: File): Boolean =
+        File(dir, "am/final.mdl").length() > 1_000_000 &&
+            File(dir, "conf/model.conf").exists() &&
+            (File(dir, "graph/HCLr.fst").exists() || File(dir, "graph/HCLG.fst").exists())
+
+    /** Scarica (se serve) e carica il modello in un thread separato. Riprova da zero se è danneggiato. */
+    private fun loadModel(attempt: Int) {
         updateNotification("Preparo il modello vocale…")
-        // La prima volta l'app scarica da sola il modello italiano (~48 MB) e lo salva sul telefono.
         Thread {
             try {
-                val dir = File(filesDir, "vosk-model")
-                App.log(this, "1. Servizio avviato (Android ${Build.VERSION.SDK_INT}, ${Build.MANUFACTURER} ${Build.MODEL})")
-                if (!File(dir, ".ok").exists()) {
-                    App.log(this, "2. Modello assente: inizio download")
+                val dir = modelDir
+                App.log(this, "1. Servizio avviato (v${BuildConfig.VERSION_NAME}, Android ${Build.VERSION.SDK_INT}, ${Build.MANUFACTURER} ${Build.MODEL}) tentativo $attempt")
+                if (!File(dir, ".ok").exists() || !modelLooksComplete(dir)) {
+                    App.log(this, "2. Modello assente o incompleto: inizio download")
                     dir.deleteRecursively()
                     val inAssets = !assets.list(Config.VOSK_MODEL_ASSET_DIR).isNullOrEmpty()
                     if (inAssets) copyAssetDir(Config.VOSK_MODEL_ASSET_DIR, dir)
                     else downloadModel(dir)
+                    if (!modelLooksComplete(dir)) {
+                        throw java.io.IOException("modello incompleto dopo il download: " +
+                            (dir.list()?.joinToString() ?: "cartella vuota"))
+                    }
                     File(dir, ".ok").writeText("ok")
                     App.log(this, "3. Modello scaricato ed estratto")
                 }
                 App.log(this, "4. Carico il modello in memoria…")
+                model?.close()
                 model = Model(dir.absolutePath)
                 App.log(this, "5. Modello caricato")
                 main.post { startWakeWord() }
             } catch (e: Throwable) {
                 Log.e(TAG, "Errore caricamento modello", e)
-                App.log(this, "Errore modello: $e")
-                main.post {
-                    updateNotification("Impossibile scaricare il modello: controlla la connessione e riavvia")
+                App.log(this, "Errore modello (tentativo $attempt): $e")
+                modelDir.deleteRecursively()
+                if (attempt < 3) {
+                    main.post { updateNotification("Download non riuscito, riprovo…") }
+                    main.postDelayed({ loadModel(attempt + 1) }, 5_000)
+                } else {
+                    main.post {
+                        updateNotification("Impossibile preparare il modello: usa il Wi-Fi e premi di nuovo Salva e avvia")
+                    }
                 }
             }
         }.start()
@@ -106,6 +130,7 @@ class WakeWordService : Service() {
                 return n
             }
         }
+        if (conn.responseCode != 200) throw java.io.IOException("download: HTTP ${conn.responseCode}")
         java.util.zip.ZipInputStream(counting.buffered()).use { zip ->
             while (true) {
                 val entry = zip.nextEntry ?: break
@@ -120,6 +145,8 @@ class WakeWordService : Service() {
                 }
             }
         }
+        App.log(this, "Download: ${read / 1_000_000} MB su ${total / 1_000_000} MB")
+        if (total > 0 && read < total) throw java.io.IOException("download interrotto ($read su $total byte)")
     }
 
     private fun onTtsInit(status: Int) {
@@ -155,7 +182,16 @@ class WakeWordService : Service() {
         } catch (e: Throwable) {
             Log.e(TAG, "Errore avvio ascolto", e)
             App.log(this, "Errore ascolto: $e")
-            updateNotification("Errore: ${e.message}")
+            if (e.message?.contains("recognizer", ignoreCase = true) == true && !modelResetDone) {
+                // Il modello sul telefono è danneggiato: lo cancello e lo riscarico una volta.
+                modelResetDone = true
+                App.log(this, "Modello danneggiato: lo cancello e lo riscarico")
+                model?.close(); model = null
+                modelDir.deleteRecursively()
+                loadModel(attempt = 1)
+            } else {
+                updateNotification("Errore: ${e.message}")
+            }
         }
     }
 
@@ -184,12 +220,15 @@ class WakeWordService : Service() {
             }
         }
         App.log(this, "Frase: '$wakePhrase' - varianti nel vocabolario: $usable")
-        return if (usable.isNotEmpty()) {
-            val g = JSONArray(); usable.forEach { g.put(it) }; g.put("[unk]")
-            Recognizer(m, 16000f, g.toString())
-        } else {
-            Recognizer(m, 16000f)
+        if (usable.isNotEmpty()) {
+            try {
+                val g = JSONArray(); usable.forEach { g.put(it) }; g.put("[unk]")
+                return Recognizer(m, 16000f, g.toString())
+            } catch (e: Throwable) {
+                App.log(this, "Grammatica non accettata ($e): passo al riconoscimento libero")
+            }
         }
+        return Recognizer(m, 16000f)
     }
 
     private fun check(hyp: String?, key: String) {
