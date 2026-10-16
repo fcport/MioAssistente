@@ -1,19 +1,17 @@
 package com.example.mioassistente
 
+import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.os.Build
-import android.os.Bundle
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
-import android.speech.RecognitionListener
-import android.speech.RecognizerIntent
-import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.util.Log
@@ -26,27 +24,35 @@ import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Servizio sempre attivo:
- * 1. ascolta la TUA parola di attivazione (Vosk, offline, senza account)
- * 2. quando la sente, ascolta la tua frase (SpeechRecognizer di Android)
- * 3. la manda al TUO agente via HTTP
- * 4. legge ad alta voce la risposta e torna in ascolto
+ * 1. ascolta la parola di attivazione (Vosk, offline)
+ * 2. registra la domanda e la trascrive con Whisper sul telefono
+ * 3. la manda a Hermes e legge la risposta frase per frase mentre arriva
+ * 4. esegue le azioni sul telefono chieste da Hermes (con conferma per quelle delicate)
+ * 5. resta in ascolto per una domanda successiva; "stop" interrompe in qualsiasi momento
  */
 class WakeWordService : Service() {
 
     private var model: Model? = null
     private var wakeListener: SpeechService? = null
-    private var recognizer: SpeechRecognizer? = null
     private var tts: TextToSpeech? = null
     private var ttsReady = false
     private val main = Handler(Looper.getMainLooper())
     private val wakePhrase by lazy { Settings.wakePhrase(this).lowercase().trim() }
+    private lateinit var actions: PhoneActions
 
     override fun onCreate() {
         super.onCreate()
-        startAsForeground()
+        actions = PhoneActions(this)
+        if (!startAsForeground()) {
+            // es. dopo il riavvio Android 14+ non consente di accendere il microfono da solo
+            notifyTapToStart()
+            stopSelf()
+            return
+        }
         // Il callback può arrivare subito (anche prima che "tts" sia assegnato): lo gestiamo dopo.
         val googleTts = "com.google.android.tts"
         val hasGoogleTts = try { packageManager.getPackageInfo(googleTts, 0); true } catch (_: Throwable) { false }
@@ -55,22 +61,28 @@ class WakeWordService : Service() {
         App.log(this, "Voce: ${if (hasGoogleTts) "Google" else "predefinita del telefono (Google TTS non installato)"}")
         tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
             override fun onStart(id: String?) {}
-            override fun onError(id: String?) { main.post { startWakeWord() } }
-            override fun onDone(id: String?) { main.post { startWakeWord() } }
+            override fun onDone(id: String?) { main.post { onUtteranceEnd(id) } }
+            @Deprecated("Deprecated in Java")
+            override fun onError(id: String?) { main.post { onUtteranceEnd(id) } }
+            override fun onStop(id: String?, interrupted: Boolean) { main.post { onUtteranceEnd(id) } }
         })
         loadModel(attempt = 1)
     }
 
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
+
+    // =====================================================================
+    // Modello Vosk (parola di attivazione e fine frase)
+    // =====================================================================
+
     private var modelResetDone = false
     private val modelDir by lazy { File(filesDir, "vosk-model") }
 
-    /** Il modello è completo solo se ci sono i file essenziali. */
     private fun modelLooksComplete(dir: File): Boolean =
         File(dir, "am/final.mdl").length() > 1_000_000 &&
             File(dir, "conf/model.conf").exists() &&
             (File(dir, "graph/HCLr.fst").exists() || File(dir, "graph/HCLG.fst").exists())
 
-    /** Scarica (se serve) e carica il modello in un thread separato. Riprova da zero se è danneggiato. */
     private fun loadModel(attempt: Int) {
         updateNotification("Preparo il modello vocale…")
         Thread {
@@ -81,8 +93,7 @@ class WakeWordService : Service() {
                     App.log(this, "2. Modello assente o incompleto: inizio download")
                     dir.deleteRecursively()
                     val inAssets = !assets.list(Config.VOSK_MODEL_ASSET_DIR).isNullOrEmpty()
-                    if (inAssets) copyAssetDir(Config.VOSK_MODEL_ASSET_DIR, dir)
-                    else downloadModel(dir)
+                    if (inAssets) copyAssetDir(Config.VOSK_MODEL_ASSET_DIR, dir) else downloadModel(dir)
                     if (!modelLooksComplete(dir)) {
                         throw java.io.IOException("modello incompleto dopo il download: " +
                             (dir.list()?.joinToString() ?: "cartella vuota"))
@@ -104,15 +115,12 @@ class WakeWordService : Service() {
                     main.post { updateNotification("Download non riuscito, riprovo…") }
                     main.postDelayed({ loadModel(attempt + 1) }, 5_000)
                 } else {
-                    main.post {
-                        updateNotification("Impossibile preparare il modello: usa il Wi-Fi e premi di nuovo Salva e avvia")
-                    }
+                    main.post { updateNotification("Impossibile preparare il modello: usa il Wi-Fi e premi di nuovo Salva e avvia") }
                 }
             }
         }.start()
     }
 
-    /** Scarica lo zip del modello e lo estrae in [dest], togliendo la cartella principale. */
     private fun downloadModel(dest: File) {
         val conn = URL(Config.VOSK_MODEL_URL).openConnection() as HttpURLConnection
         conn.instanceFollowRedirects = true
@@ -152,25 +160,16 @@ class WakeWordService : Service() {
         if (total > 0 && read < total) throw java.io.IOException("download interrotto ($read su $total byte)")
     }
 
-    private fun onTtsInit(status: Int) {
-        ttsReady = status == TextToSpeech.SUCCESS
-        if (ttsReady) {
-            val r = try { tts?.setLanguage(Locale.ITALIAN) } catch (_: Throwable) { null }
-            App.log(this, "Voce pronta (italiano: ${r != null && r >= 0})")
-        } else {
-            App.log(this, "Motore vocale non disponibile (stato $status): le risposte compariranno solo nella notifica")
-        }
-    }
+    // =====================================================================
+    // 1. Parola di attivazione
+    // =====================================================================
 
-    // ---------- 1. Parola di attivazione ----------
     private fun startWakeWord() {
         val m = model ?: return
+        if (wakeListener != null) return
+        conversationActive = false
         try {
-            // Grammatica ristretta: Vosk sceglie solo tra la tua frase e "rumore",
-            // così è veloce, leggero e poco soggetto a falsi allarmi.
-            App.log(this, "6. Preparo il riconoscitore…")
             val rec = buildRecognizer(m)
-            App.log(this, "7. Avvio microfono…")
             wakeListener = SpeechService(rec, 16000f).also {
                 it.startListening(object : org.vosk.android.RecognitionListener {
                     override fun onPartialResult(hyp: String?) = check(hyp, "partial")
@@ -180,13 +179,11 @@ class WakeWordService : Service() {
                     override fun onTimeout() {}
                 })
             }
-            App.log(this, "8. In ascolto")
             updateNotification("In ascolto di \"$wakePhrase\"…")
         } catch (e: Throwable) {
             Log.e(TAG, "Errore avvio ascolto", e)
             App.log(this, "Errore ascolto: $e")
             if (e.message?.contains("recognizer", ignoreCase = true) == true && !modelResetDone) {
-                // Il modello sul telefono è danneggiato: lo cancello e lo riscarico una volta.
                 modelResetDone = true
                 App.log(this, "Modello danneggiato: lo cancello e lo riscarico")
                 model?.close(); model = null
@@ -205,24 +202,15 @@ class WakeWordService : Service() {
     private val wakeNorm by lazy { norm(wakePhrase) }
     private val wakeKey by lazy { wakeNorm.split(" ").last() }
 
-    /**
-     * Se tutte le parole della frase sono nel vocabolario del modello usa una grammatica ristretta
-     * (veloce, pochi falsi allarmi); altrimenti riconoscimento libero e confronto tollerante.
-     */
+    private fun inVocabulary(m: Model, word: String): Boolean = try {
+        val f = m.javaClass.methods.firstOrNull { it.name == "findWord" }
+        f != null && (f.invoke(m, word) as Int) >= 0
+    } catch (_: Throwable) { false }
+
     private fun buildRecognizer(m: Model): Recognizer {
         val variants = linkedSetOf(wakePhrase, wakePhrase.replace("h", ""), wakePhrase.split(" ").last(),
             wakePhrase.split(" ").last().replace("h", ""))
-        val usable = variants.filter { v ->
-            v.isNotBlank() && v.split(" ").all { w ->
-                try {
-                    // findWord può non esistere in tutte le versioni di Vosk: in quel caso
-                    // si usa il riconoscimento libero.
-                    val f = m.javaClass.methods.firstOrNull { it.name == "findWord" }
-                    f != null && (f.invoke(m, w) as Int) >= 0
-                } catch (_: Throwable) { false }
-            }
-        }
-        App.log(this, "Frase: '$wakePhrase' - varianti nel vocabolario: $usable")
+        val usable = variants.filter { v -> v.isNotBlank() && v.split(" ").all { inVocabulary(m, it) } }
         if (usable.isNotEmpty()) {
             try {
                 val g = JSONArray(); usable.forEach { g.put(it) }; g.put("[unk]")
@@ -235,19 +223,19 @@ class WakeWordService : Service() {
     }
 
     private fun check(hyp: String?, key: String) {
-        val raw = try { hyp?.let { JSONObject(it).optString(key) } } catch (_: Throwable) { null } ?: return
-        val text = norm(raw)
+        val text = norm(parse(hyp, key))
         if (text.isEmpty()) return
         val hit = text.contains(wakeNorm) || (wakeKey.length >= 4 && text.split(" ").contains(wakeKey))
-        if (hit) { App.log(this, "Attivato da: '$raw'"); main.post { onWakeWord() } }
+        if (hit) { App.log(this, "Attivato da: '$text'"); main.post { onWakeWord() } }
     }
 
     private fun onWakeWord() {
         if (wakeListener == null) return // già scattato
-        stopWakeWord() // libera il microfono per il riconoscimento della frase
-        updateNotification("Ti ascolto…")
-        playEarcon() // piccolo segnale
-        listenForCommand()
+        stopWakeWord()
+        conversationActive = true
+        actionDepth = 0
+        playEarcon()
+        listenForCommand(followUp = false)
     }
 
     private fun stopWakeWord() {
@@ -256,34 +244,47 @@ class WakeWordService : Service() {
         wakeListener = null
     }
 
-    // ---------- 2. Ascolto della frase ----------
-    // ---------- 2. Ascolto della domanda ----------
-    // Registra l'audio: il modello Vosk sul telefono decide quando hai finito di parlare e fa da riserva;
-    // la domanda viene poi trascritta da Whisper sul telefono (capisce anche parole inventate).
-    @Volatile private var recording = false
+    // =====================================================================
+    // 2. Ascolto della domanda (registrazione + Whisper)
+    // =====================================================================
 
-    private fun listenForCommand() {
-        val m = model ?: run { startWakeWord(); return }
+    @Volatile private var recording = false
+    private var conversationActive = false
+
+    /** Ascolta una domanda. Se non dici nulla, torna in attesa della parola di attivazione. */
+    private fun listenForCommand(followUp: Boolean) {
+        updateNotification(if (followUp) "Ti ascolto (puoi continuare)…" else "Ti ascolto…")
+        captureUtterance(if (followUp) 5_000 else 6_000) { text ->
+            if (text.isBlank()) {
+                App.log(this, if (followUp) "Fine conversazione" else "Nessuna domanda sentita")
+                startWakeWord()
+            } else {
+                actionDepth = 0
+                askAgent(text, fromUser = true)
+            }
+        }
+    }
+
+    /** Registra finché parli, trascrive (Whisper se pronto, altrimenti Vosk) e restituisce il testo. */
+    private fun captureUtterance(noSpeechMs: Long, done: (String) -> Unit) {
+        val m = model ?: run { done(""); return }
         recording = true
         Thread {
-            var voskText = ""
-            var pcm = ByteArray(0)
-            try {
-                val r = recordCommand(m)
-                voskText = r.first; pcm = r.second
-            } catch (e: Throwable) {
-                App.log(this, "Errore registrazione domanda: $e")
+            var rec = Recording("", ByteArray(0), false)
+            try { rec = recordCommand(m, noSpeechMs) } catch (e: Throwable) {
+                App.log(this, "Errore registrazione: $e")
             }
             recording = false
-            var text = voskText
+            var text = rec.voskText
             val ctx = whisperCtx
-            if (ctx != 0L && pcm.size > 8000) { // almeno un quarto di secondo di audio
+            if (rec.heardSpeech && ctx != 0L && rec.pcm.size > 8000) {
                 main.post { updateNotification("Trascrivo…") }
-                val w = try { transcribeLocal(ctx, pcm) } catch (e: Throwable) {
+                val w = try { transcribeLocal(ctx, rec.pcm) } catch (e: Throwable) {
                     App.log(this, "Errore Whisper: $e"); null
                 }
                 if (!w.isNullOrBlank()) text = w
             }
+            if (!rec.heardSpeech) text = ""
             // togli l'eventuale frase di attivazione ripetuta all'inizio
             val words = text.trim().split(Regex("\\s+"))
             val n = wakePhrase.split(" ").size
@@ -291,15 +292,14 @@ class WakeWordService : Service() {
                 text = words.drop(n).joinToString(" ")
             }
             text = text.trim().trim(',', '.', ' ')
-            main.post {
-                if (text.isBlank()) { App.log(this, "Nessuna domanda sentita"); startWakeWord() }
-                else askAgent(text)
-            }
+            main.post { done(text) }
         }.start()
     }
 
-    /** Registra finché parli (si ferma dopo ~1,5 s di silenzio). Ritorna testo Vosk + audio PCM 16 kHz. */
-    private fun recordCommand(m: Model): Pair<String, ByteArray> {
+    private class Recording(val voskText: String, val pcm: ByteArray, val heardSpeech: Boolean)
+
+    /** Registra finché parli (si ferma dopo ~1,5 s di silenzio). */
+    private fun recordCommand(m: Model, noSpeechMs: Long): Recording {
         val rate = 16000
         val min = android.media.AudioRecord.getMinBufferSize(rate,
             android.media.AudioFormat.CHANNEL_IN_MONO, android.media.AudioFormat.ENCODING_PCM_16BIT)
@@ -322,15 +322,7 @@ class WakeWordService : Service() {
                 if (n <= 0) continue
                 out.write(buf, 0, n)
                 val now = System.currentTimeMillis()
-                // volume: se c'è voce, aggiorna l'ultimo istante di parlato
-                var sum = 0.0
-                var i = 0
-                while (i + 1 < n) {
-                    val v = ((buf[i + 1].toInt() shl 8) or (buf[i].toInt() and 0xff)).toShort().toDouble()
-                    sum += v * v; i += 2
-                }
-                val rms = Math.sqrt(sum / (n / 2).coerceAtLeast(1))
-                if (rms > 900) { lastSpeech = now; heardAny = true }
+                if (rms(buf, n) > 900) { lastSpeech = now; heardAny = true }
                 if (rec.acceptWaveForm(buf, n)) {
                     val t = parse(rec.result, "text")
                     if (t.isNotBlank()) { text.append(' ').append(t); lastSpeech = now; heardAny = true }
@@ -343,9 +335,9 @@ class WakeWordService : Service() {
                     }
                 }
                 val elapsed = now - start
-                if (!heardAny && elapsed > 6_000) break          // non hai detto nulla
-                if (heardAny && now - lastSpeech > 1_500) break  // hai finito di parlare
-                if (elapsed > 20_000) break                       // massimo 20 secondi
+                if (!heardAny && elapsed > noSpeechMs) break
+                if (heardAny && now - lastSpeech > 1_500) break
+                if (elapsed > 20_000) break
             }
         } finally {
             try { ar.stop() } catch (_: Throwable) {}
@@ -355,14 +347,26 @@ class WakeWordService : Service() {
         rec.close()
         val t = text.toString().trim()
         App.log(this, "Modello telefono ha capito: '$t'")
-        return t to out.toByteArray()
+        return Recording(t, out.toByteArray(), heardAny || t.isNotBlank())
     }
 
-    // ---------- Whisper sul telefono ----------
+    private fun rms(buf: ByteArray, n: Int): Double {
+        var sum = 0.0
+        var i = 0
+        while (i + 1 < n) {
+            val v = ((buf[i + 1].toInt() shl 8) or (buf[i].toInt() and 0xff)).toShort().toDouble()
+            sum += v * v; i += 2
+        }
+        return Math.sqrt(sum / (n / 2).coerceAtLeast(1))
+    }
+
+    // =====================================================================
+    // Whisper sul telefono
+    // =====================================================================
+
     @Volatile private var whisperCtx = 0L
     private val whisperFile by lazy { File(filesDir, "whisper/" + Config.WHISPER_MODEL_NAME) }
 
-    /** Scarica (la prima volta) e carica il modello Whisper. Finché non è pronto si usa Vosk. */
     private fun prepareWhisper() {
         if (whisperCtx != 0L) return
         if (!Whisper.available) { App.log(this, "Whisper: libreria non disponibile"); return }
@@ -388,8 +392,9 @@ class WakeWordService : Service() {
                                 val pct = (read * 100 / total).toInt()
                                 if (pct != last && pct % 10 == 0) {
                                     last = pct
-                                    if (!recording && wakeListener != null) main.post {
-                                        updateNotification("In ascolto di \"$wakePhrase\"… (preparo il riconoscimento avanzato $pct%)")
+                                    main.post {
+                                        if (!conversationActive && wakeListener != null)
+                                            updateNotification("In ascolto di \"$wakePhrase\"… (preparo il riconoscimento avanzato $pct%)")
                                     }
                                 }
                             }
@@ -409,7 +414,7 @@ class WakeWordService : Service() {
                 }
                 whisperCtx = ctx
                 App.log(this, "W3. Whisper pronto (${System.currentTimeMillis() - t0} ms)")
-                main.post { if (!recording && wakeListener != null) updateNotification("In ascolto di \"$wakePhrase\"…") }
+                main.post { if (!conversationActive && wakeListener != null) updateNotification("In ascolto di \"$wakePhrase\"…") }
             } catch (e: Throwable) {
                 App.log(this, "Whisper non disponibile per ora ($e): uso il modello base")
             }
@@ -421,14 +426,16 @@ class WakeWordService : Service() {
         val audio = FloatArray(n)
         val bb = java.nio.ByteBuffer.wrap(pcm).order(java.nio.ByteOrder.LITTLE_ENDIAN)
         for (i in 0 until n) audio[i] = bb.getShort(i * 2) / 32768f
-        // contesto audio proporzionale alla durata: molto più veloce per frasi brevi
         val seconds = n / 16000.0
         val audioCtx = minOf(1500, (seconds * 50).toInt() + 128)
         val threads = Runtime.getRuntime().availableProcessors().coerceIn(2, 6)
         val t0 = System.currentTimeMillis()
         val raw = Whisper.nativeTranscribe(ctx, audio, threads, audioCtx) ?: return null
-        // togli annotazioni tipo [Musica] o (risate) che Whisper aggiunge sul silenzio
-        val text = raw.replace(Regex("[\\[(][^\\])]*[\\])]"), " ").replace(Regex("\\s+"), " ").trim()
+        var text = raw.replace(Regex("[\\[(][^\\])]*[\\])]"), " ").replace(Regex("\\s+"), " ").trim()
+        // frasi che Whisper "inventa" sul silenzio
+        val lower = text.lowercase()
+        if (lower.contains("amara.org") || lower.contains("sottotitoli") || lower == "grazie per la visione." ||
+            lower == "grazie a tutti." || lower == "grazie.") text = ""
         App.log(this, "Whisper ha capito: '$text' (${System.currentTimeMillis() - t0} ms)")
         return text
     }
@@ -436,84 +443,270 @@ class WakeWordService : Service() {
     private fun parse(hyp: String?, key: String): String =
         try { hyp?.let { JSONObject(it).optString(key) } ?: "" } catch (_: Throwable) { "" }
 
-    /** Usa il riconoscimento vocale di Google se presente (quello Xiaomi può essere in cinese). */
-    private fun createItalianRecognizer(): SpeechRecognizer {
-        val services = packageManager.queryIntentServices(
-            Intent(android.speech.RecognitionService.SERVICE_INTERFACE), 0
-        ).map { android.content.ComponentName(it.serviceInfo.packageName, it.serviceInfo.name) }
-        val google = services.firstOrNull { it.packageName == "com.google.android.googlequicksearchbox" }
-            ?: services.firstOrNull { it.packageName.startsWith("com.google") }
-        App.log(this, "Riconoscitori disponibili: ${services.joinToString { it.packageName }} -> uso ${google?.packageName ?: "predefinito"}")
-        return if (google != null) SpeechRecognizer.createSpeechRecognizer(this, google)
-        else SpeechRecognizer.createSpeechRecognizer(this)
-    }
+    // =====================================================================
+    // 3. Hermes: risposta in streaming, letta frase per frase
+    // =====================================================================
 
-    // ---------- 3. Chiamata a Hermes (API compatibile OpenAI) ----------
-    // Memoria della conversazione: gli ultimi scambi vengono rimandati a Hermes
     private val history = mutableListOf<JSONObject>()
+    private var turnId = 0
+    private var hermes: HermesClient? = null
+    @Volatile private var streamDone = true
+    private var turnFinishing = false
+    private val pendingActions = mutableListOf<JSONObject>()
+    private val pendingSpeech = AtomicInteger(0)
+    private var actionDepth = 0
 
-    private fun askAgent(text: String) {
-        updateNotification("Hai detto: $text")
-        App.log(this, "Hai detto: $text")
+    private fun askAgent(text: String, fromUser: Boolean) {
+        turnId++
+        val myTurn = turnId
+        streamDone = false
+        turnFinishing = false
+        pendingActions.clear()
+        pendingSpeech.set(0)
+        if (fromUser) {
+            updateNotification("Hai detto: $text")
+            App.log(this, "Hai detto: $text")
+        } else {
+            updateNotification("Elaboro…")
+            App.log(this, "Invio a Hermes: ${text.take(200)}")
+        }
+        history += JSONObject().put("role", "user").put("content", text)
+        while (history.size > 24) history.removeAt(0)
+        val messages = JSONArray().put(JSONObject().put("role", "system").put("content", actions.systemPrompt()))
+        history.forEach { messages.put(it) }
+
+        val client = HermesClient(Settings.hermesUrl(this), Settings.hermesKey(this))
+        hermes = client
+        startStopListener()
         Thread {
-            val reply = try {
-                history += JSONObject().put("role", "user").put("content", text)
-                while (history.size > 20) history.removeAt(0)
-
-                val messages = JSONArray().put(
-                    JSONObject().put("role", "system").put(
-                        "content",
-                        "Stai parlando a voce. Rispondi in italiano, in modo breve e naturale, " +
-                            "senza elenchi, simboli o markdown: il testo verrà letto ad alta voce."
-                    )
-                )
-                history.forEach { messages.put(it) }
-
-                val conn = URL("${Settings.hermesUrl(this).trimEnd('/')}/v1/chat/completions")
-                    .openConnection() as HttpURLConnection
-                conn.requestMethod = "POST"
-                conn.connectTimeout = 10_000
-                conn.readTimeout = 180_000 // Hermes può usare strumenti e metterci un po'
-                conn.setRequestProperty("Content-Type", "application/json")
-                conn.setRequestProperty("Authorization", "Bearer ${Settings.hermesKey(this)}")
-                conn.doOutput = true
-                val body = JSONObject()
-                    .put("model", "hermes-agent")
-                    .put("messages", messages)
-                    .put("stream", false)
-                conn.outputStream.use { it.write(body.toString().toByteArray()) }
-
-                if (conn.responseCode == 401) {
-                    "Hermes ha rifiutato la chiave. Controlla la password nell.app."
-                } else {
-                    val json = JSONObject(conn.inputStream.bufferedReader().readText())
-                    val answer = json.getJSONArray("choices").getJSONObject(0)
-                        .getJSONObject("message").optString("content").trim()
-                    history += JSONObject().put("role", "assistant").put("content", answer)
-                    answer.ifEmpty { "Non ho ricevuto risposta." }
+            val seg = Segmenter()
+            val full = StringBuilder()
+            var error: String? = null
+            try {
+                client.stream(messages) { delta ->
+                    full.append(delta)
+                    val (sentences, acts) = seg.feed(delta)
+                    if (sentences.isNotEmpty() || acts.isNotEmpty()) main.post {
+                        if (myTurn == turnId) { sentences.forEach { speakPart(it) }; pendingActions += acts }
+                    }
                 }
+                val (sentences, acts) = seg.flush()
+                main.post { if (myTurn == turnId) { sentences.forEach { speakPart(it) }; pendingActions += acts } }
+            } catch (e: HermesClient.CancelledException) {
+                return@Thread
+            } catch (e: HermesClient.AuthException) {
+                error = "Hermes ha rifiutato la password. Controllala nell'app."
             } catch (e: java.net.SocketTimeoutException) {
-                "Hermes ci sta mettendo troppo a rispondere."
+                error = "Hermes ci sta mettendo troppo a rispondere."
             } catch (e: Throwable) {
-                Log.e(TAG, "Errore Hermes", e)
                 App.log(this, "Errore Hermes: $e")
-                "Non riesco a raggiungere Hermes. Il computer è acceso e sulla stessa Wi-Fi?"
+                error = "Non riesco a raggiungere Hermes. Il computer è acceso?"
             }
-            main.post { speak(reply) }
+            val answer = full.toString().trim()
+            val err = error
+            App.log(this, "Risposta: ${answer.take(200)}")
+            main.post {
+                if (myTurn != turnId) return@post
+                if (err != null) speakPart(err)
+                else if (answer.isEmpty()) speakPart("Non ho ricevuto risposta.")
+                if (answer.isNotEmpty()) {
+                    history += JSONObject().put("role", "assistant").put("content", answer)
+                }
+                streamDone = true
+                maybeFinishTurn()
+            }
         }.start()
     }
 
-    // ---------- 4. Risposta a voce ----------
-    private fun speak(text: String) {
-        App.log(this, "Risposta: ${text.take(120)}")
+    // =====================================================================
+    // 4. Voce
+    // =====================================================================
+
+    private var utteranceSeq = 0
+    private val afterUtterance = HashMap<String, () -> Unit>()
+
+    /** Legge un pezzo della risposta (in coda dopo i precedenti). */
+    private fun speakPart(text: String) {
         updateNotification(text)
-        val ok = ttsReady && try {
-            tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "reply") == TextToSpeech.SUCCESS
-        } catch (_: Throwable) { false }
-        if (!ok) startWakeWord() // senza voce: risposta solo in notifica, poi torna in ascolto
+        if (!ttsReady) return
+        val id = "s${turnId}_${utteranceSeq++}"
+        pendingSpeech.incrementAndGet()
+        val ok = try { tts?.speak(text, TextToSpeech.QUEUE_ADD, null, id) == TextToSpeech.SUCCESS } catch (_: Throwable) { false }
+        if (!ok) pendingSpeech.decrementAndGet()
     }
 
-    // ---------- Utilità ----------
+    /** Dice una frase e poi esegue [then]. */
+    private fun speakThen(text: String, then: () -> Unit) {
+        updateNotification(text)
+        if (!ttsReady) { main.post(then); return }
+        val id = "x${turnId}_${utteranceSeq++}"
+        afterUtterance[id] = then
+        val ok = try { tts?.speak(text, TextToSpeech.QUEUE_ADD, null, id) == TextToSpeech.SUCCESS } catch (_: Throwable) { false }
+        if (!ok) { afterUtterance.remove(id); main.post(then) }
+    }
+
+    private fun onUtteranceEnd(id: String?) {
+        id ?: return
+        if (!id.startsWith("s$turnId" + "_") && !id.startsWith("x$turnId" + "_")) return // turno vecchio
+        if (id.startsWith("s")) {
+            if (pendingSpeech.decrementAndGet() < 0) pendingSpeech.set(0)
+            maybeFinishTurn()
+        } else {
+            afterUtterance.remove(id)?.invoke()
+        }
+    }
+
+    private fun onTtsInit(status: Int) {
+        ttsReady = status == TextToSpeech.SUCCESS
+        if (ttsReady) {
+            val r = try { tts?.setLanguage(Locale.ITALIAN) } catch (_: Throwable) { null }
+            App.log(this, "Voce pronta (italiano: ${r != null && r >= 0})")
+        } else {
+            App.log(this, "Motore vocale non disponibile (stato $status): le risposte compariranno solo nella notifica")
+        }
+    }
+
+    // =====================================================================
+    // 5. Fine turno: azioni, conferme, domanda successiva
+    // =====================================================================
+
+    private fun maybeFinishTurn() {
+        if (!streamDone || pendingSpeech.get() > 0 || turnFinishing) return
+        turnFinishing = true
+        stopStopListener()
+        val list = ArrayList(pendingActions)
+        pendingActions.clear()
+        runActions(list, mutableListOf())
+    }
+
+    private fun runActions(list: MutableList<JSONObject>, results: MutableList<String>) {
+        val myTurn = turnId
+        if (list.isEmpty()) {
+            if (results.isNotEmpty() && actionDepth < 3) {
+                actionDepth++
+                askAgent(results.joinToString("\n"), fromUser = false)
+            } else {
+                followUp()
+            }
+            return
+        }
+        val a = list.removeAt(0)
+        val exec = {
+            Thread {
+                val r = actions.execute(a)
+                main.post {
+                    if (myTurn != turnId) return@post
+                    r.data?.let { results += "[RISULTATO ${a.optString("tipo")}] $it" }
+                    if (r.spoken != null) speakThen(r.spoken) { runActions(list, results) }
+                    else runActions(list, results)
+                }
+            }.start()
+        }
+        if (actions.needsConfirmation(a)) {
+            speakThen(actions.confirmationQuestion(a)) {
+                playEarcon()
+                updateNotification("Rispondi sì o no…")
+                captureUtterance(5_000) { answer ->
+                    if (myTurn != turnId) return@captureUtterance
+                    App.log(this, "Conferma: '$answer'")
+                    if (isYes(answer)) exec()
+                    else speakThen("Ok, annullato.") { runActions(list, results) }
+                }
+            }
+        } else {
+            exec()
+        }
+    }
+
+    private fun isYes(t: String): Boolean {
+        val n = t.lowercase().replace(Regex("[^a-zàèéìòù ]"), " ").replace(Regex("\\s+"), " ").trim()
+        if (n.isEmpty() || n.startsWith("no")) return false
+        val yes = listOf("si", "sì", "certo", "ok", "okay", "conferma", "confermo", "vai", "esatto", "procedi", "va bene", "sicuro", "fallo")
+        return yes.any { n == it || n.startsWith("$it ") || n.contains(" $it") }
+    }
+
+    /** Dopo la risposta resta in ascolto qualche secondo: puoi continuare senza ridire la parola di attivazione. */
+    private fun followUp() {
+        if (!conversationActive) { startWakeWord(); return }
+        playEarcon()
+        listenForCommand(followUp = true)
+    }
+
+    // =====================================================================
+    // "Stop": interrompe Hermes e la voce in qualsiasi momento
+    // =====================================================================
+
+    @Volatile private var stopRunning = false
+    private var stopThread: Thread? = null
+
+    private fun startStopListener() {
+        val m = model ?: return
+        if (stopThread != null) return
+        val words = listOf("stop", "fermati", "basta").filter { inVocabulary(m, it) }
+        if (words.isEmpty()) return
+        stopRunning = true
+        val myTurn = turnId
+        stopThread = Thread {
+            var ar: android.media.AudioRecord? = null
+            var rec: Recognizer? = null
+            try {
+                val g = JSONArray(); words.forEach { g.put(it) }; g.put("[unk]")
+                rec = Recognizer(m, 16000f, g.toString())
+                val min = android.media.AudioRecord.getMinBufferSize(16000,
+                    android.media.AudioFormat.CHANNEL_IN_MONO, android.media.AudioFormat.ENCODING_PCM_16BIT)
+                @Suppress("MissingPermission")
+                val r = android.media.AudioRecord(android.media.MediaRecorder.AudioSource.VOICE_COMMUNICATION, 16000,
+                    android.media.AudioFormat.CHANNEL_IN_MONO, android.media.AudioFormat.ENCODING_PCM_16BIT,
+                    maxOf(min, 8192) * 2)
+                ar = r
+                r.startRecording()
+                val buf = ByteArray(3200)
+                while (stopRunning) {
+                    val n = r.read(buf, 0, buf.size)
+                    if (n <= 0) continue
+                    val heard = if (rec.acceptWaveForm(buf, n)) parse(rec.result, "text") else parse(rec.partialResult, "partial")
+                    if (words.any { w -> heard.split(" ").contains(w) }) {
+                        App.log(this, "Interrotto con \"$heard\"")
+                        main.post { if (myTurn == turnId) onBargeIn() }
+                        break
+                    }
+                }
+            } catch (e: Throwable) {
+                App.log(this, "Ascolto dello stop non disponibile: $e")
+            } finally {
+                try { ar?.stop() } catch (_: Throwable) {}
+                ar?.release()
+                rec?.close()
+            }
+        }.also { it.start() }
+    }
+
+    private fun stopStopListener() {
+        stopRunning = false
+        val t = stopThread
+        stopThread = null
+        if (t != null && t !== Thread.currentThread()) try { t.join(800) } catch (_: Throwable) {}
+    }
+
+    private fun onBargeIn() {
+        turnId++ // invalida tutto quello che appartiene al turno interrotto
+        hermes?.cancel()
+        try { tts?.stop() } catch (_: Throwable) {}
+        pendingSpeech.set(0)
+        pendingActions.clear()
+        afterUtterance.clear()
+        streamDone = true
+        turnFinishing = true
+        stopStopListener()
+        conversationActive = true
+        playEarcon()
+        listenForCommand(followUp = true)
+    }
+
+    // =====================================================================
+    // Utilità
+    // =====================================================================
+
     private fun copyAssetDir(assetPath: String, dest: File) {
         val children = assets.list(assetPath) ?: emptyArray()
         if (children.isEmpty()) {
@@ -532,41 +725,67 @@ class WakeWordService : Service() {
         } catch (_: Throwable) {}
     }
 
-    // ---------- Notifica fissa (obbligatoria per ascoltare in background) ----------
-    private fun startAsForeground() {
+    private fun startAsForeground(): Boolean {
         val nm = getSystemService(NotificationManager::class.java)
-        nm.createNotificationChannel(
-            NotificationChannel(CHANNEL, "Assistente", NotificationManager.IMPORTANCE_LOW)
-        )
+        nm.createNotificationChannel(NotificationChannel(CHANNEL, "Assistente", NotificationManager.IMPORTANCE_LOW))
         val n = buildNotification("Avvio…")
         try {
             if (Build.VERSION.SDK_INT >= 30) {
-                startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+                var types = ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+                // la posizione si può leggere in background solo se dichiarata (e concessa) all'avvio
+                if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
+                    checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+                ) types = types or ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
+                startForeground(1, n, types)
             } else {
                 startForeground(1, n)
             }
+            return true
         } catch (e: Throwable) {
-            App.log(this, "startForeground fallito: $e")
-            throw e
+            App.log(this, "Avvio in background non consentito da Android: $e")
+            return false
         }
     }
 
-    private fun buildNotification(text: String): Notification =
-        Notification.Builder(this, CHANNEL)
+    private fun notifyTapToStart() {
+        val nm = getSystemService(NotificationManager::class.java)
+        nm.createNotificationChannel(NotificationChannel(CHANNEL, "Assistente", NotificationManager.IMPORTANCE_LOW))
+        val i = Intent(this, MainActivity::class.java).putExtra("avvia", true)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        val pi = android.app.PendingIntent.getActivity(this, 1, i,
+            android.app.PendingIntent.FLAG_IMMUTABLE or android.app.PendingIntent.FLAG_UPDATE_CURRENT)
+        nm.notify(2, Notification.Builder(this, CHANNEL)
+            .setContentTitle("Mio Assistente è in pausa")
+            .setContentText("Tocca per riattivarlo")
+            .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+            .setContentIntent(pi)
+            .setAutoCancel(true)
+            .build())
+    }
+
+    private fun buildNotification(text: String): Notification {
+        val open = android.app.PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java),
+            android.app.PendingIntent.FLAG_IMMUTABLE)
+        return Notification.Builder(this, CHANNEL)
             .setContentTitle("Mio Assistente")
             .setContentText(text)
+            .setStyle(Notification.BigTextStyle().bigText(text))
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+            .setContentIntent(open)
             .setOngoing(true)
             .build()
+    }
 
     private fun updateNotification(text: String) {
         getSystemService(NotificationManager::class.java).notify(1, buildNotification(text))
     }
 
     override fun onDestroy() {
+        turnId++
+        hermes?.cancel()
+        stopStopListener()
         stopWakeWord()
         recording = false
-        recognizer?.destroy()
         if (whisperCtx != 0L) { Whisper.nativeFree(whisperCtx); whisperCtx = 0L }
         model?.close()
         tts?.shutdown()

@@ -23,9 +23,15 @@ class App : Application() {
     }
 
     companion object {
+        private val fmt = java.text.SimpleDateFormat("dd/MM HH:mm:ss", java.util.Locale.ITALIAN)
+
+        @Synchronized
         fun log(ctx: android.content.Context, msg: String) {
             try {
-                File(ctx.filesDir, "registro.txt").appendText("${java.util.Date()}  $msg\n")
+                val f = File(ctx.filesDir, "registro.txt")
+                // non far crescere il registro all'infinito
+                if (f.length() > 200_000) f.writeText(f.readText().takeLast(100_000))
+                f.appendText("${fmt.format(java.util.Date())}  $msg\n")
             } catch (_: Throwable) {}
         }
     }
